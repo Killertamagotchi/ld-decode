@@ -27,20 +27,67 @@ import numba
 import numpy as np
 import sys
 
+import scipy.interpolate as spi
+
+try:
+    from numba.experimental import jitclass
+except ImportError:
+    # Prior to numba 0.49
+    from numba import jitclass
+
+
+def computeefmfilter(freq_hz=40000000, blocklen=65536):
+    """Frequency-domain equalisation filter for the LaserDisc EFM signal.
+    This was inspired by the input signal equaliser in WSJT-X, described in
+    Steven J. Franke and Joseph H. Taylor, "The MSK144 Protocol for
+    Meteor-Scatter Communication", QEX July/August 2017.
+    <http://physics.princeton.edu/pulsar/k1jt/MSK144_Protocol_QEX.pdf>
+
+    This improved EFM filter was devised by Adam Sampson (@atsampson)
+    """
+    # Frequency bands
+    freqs = np.linspace(0.0e6, 2.0e6, num=11)
+    freq_per_bin = freq_hz / blocklen
+    # Amplitude and phase adjustments for each band.
+    # These values were adjusted empirically based on a selection of NTSC and PAL samples.
+    amp = np.array([0.0, 0.215, 0.41, 0.73, 0.98, 1.03, 0.99, 0.81, 0.59, 0.42, 0.0])
+    phase = np.array(
+        [0.0, -0.92, -1.03, -1.11, -1.2, -1.2, -1.2, -1.2, -1.05, -0.95, -0.8]
+    )
+    phase = [p * 1.25 for p in phase]
+
+    """Compute filter coefficients for the given FFTFilter."""
+    # Anything above the highest frequency is left as zero.
+    coeffs = np.zeros(blocklen, dtype=complex)
+
+    # Generate the frequency-domain coefficients by cubic interpolation between the equaliser values.
+    a_interp = spi.interp1d(freqs, amp, kind="cubic")
+    p_interp = spi.interp1d(freqs, phase, kind="cubic")
+
+    nonzero_bins = int(freqs[-1] / freq_per_bin) + 1
+
+    bin_freqs = np.arange(nonzero_bins) * freq_per_bin
+    bin_amp = a_interp(bin_freqs)
+    bin_phase = p_interp(bin_freqs)
+
+    # Scale by the amplitude, rotate by the phase
+    coeffs[:nonzero_bins] = bin_amp * (
+        np.cos(bin_phase) + (complex(0, -1) * np.sin(bin_phase))
+    )
+
+    return coeffs * 8
+
+
 # Attribute types of EFM_PLL for numba.
 EFM_PLL_spec = [
     ("zcPreviousInput", numba.int16),
     ("delta", numba.float64),
-
     ("pllResult", numba.int8[:]),
     ("pllResultCount", numba.uintp),
-
     ("basePeriod", numba.float64),
-
     ("minimumPeriod", numba.float64),
     ("maximumPeriod", numba.float64),
     ("periodAdjustBase", numba.float64),
-
     ("currentPeriod", numba.float64),
     ("phaseAdjust", numba.float64),
     ("refClockTime", numba.float64),
@@ -48,7 +95,8 @@ EFM_PLL_spec = [
     ("tCounter", numba.int8),
 ]
 
-@numba.jitclass(EFM_PLL_spec)
+
+@jitclass(EFM_PLL_spec)
 class EFM_PLL:
     def __init__(self):
         # ZC detector state
@@ -60,11 +108,11 @@ class EFM_PLL:
         self.pllResultCount = 0
 
         # PLL state
-        self.basePeriod = 40000000.0 / 4321800.0 # T1 clock period 40MSPS / bit-rate
+        self.basePeriod = 40000000.0 / 4321800.0  # T1 clock period 40MSPS / bit-rate
 
-        self.minimumPeriod = self.basePeriod * 0.90 # -10% minimum
-        self.maximumPeriod = self.basePeriod * 1.10 # +10% maximum
-        self.periodAdjustBase = self.basePeriod * 0.0001 # Clock adjustment step
+        self.minimumPeriod = self.basePeriod * 0.90  # -10% minimum
+        self.maximumPeriod = self.basePeriod * 1.10  # +10% maximum
+        self.periodAdjustBase = self.basePeriod * 0.0001  # Clock adjustment step
 
         # PLL Working parameters
         self.currentPeriod = self.basePeriod
@@ -87,6 +135,8 @@ class EFM_PLL:
 
         inputBuffer is a numpy.ndarray of np.int16 samples.
         Returns a view into a numpy.ndarray of np.int8 times."""
+
+        # print(len(inputBuffer), min(inputBuffer), max(inputBuffer))
 
         # Ensure the PLL result buffer is big enough, and clear it
         if len(self.pllResult) < len(inputBuffer):
@@ -114,7 +164,7 @@ class EFM_PLL:
             # Keep the previous input (so we can work across buffer boundaries)
             self.zcPreviousInput = curr
 
-        return self.pllResult[:self.pllResultCount]
+        return self.pllResult[: self.pllResultCount]
 
     def pushEdge(self, sampleDelta):
         """Called when a ZC happens on a sample number."""
@@ -176,7 +226,8 @@ class EFM_PLL:
         self.refClockTime -= sampleDelta
 
         # Use this debug if you want to monitor the PLL output frequency
-        #print("Base =", self.basePeriod, "current = ", self.currentPeriod, file=sys.stderr)
+        # print("Base =", self.basePeriod, "current = ", self.currentPeriod, file=sys.stderr)
+
 
 if __name__ == "__main__":
     # If invoked as a script, test the PLL by reading from stdin and writing to stdout.
